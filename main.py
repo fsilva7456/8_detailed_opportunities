@@ -3,8 +3,8 @@ import logging
 from contextlib import asynccontextmanager
 from openai import OpenAI
 from supabase import create_client, Client
-from typing import List
 from dotenv import load_dotenv
+from typing import Dict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -40,61 +40,100 @@ supabase: Client = create_client(
     os.getenv('SUPABASE_KEY')
 )
 
-class BrandRequest(BaseModel):
-    brand_name: str
+class DetailedOpportunities(BaseModel):
+    detailed_opportunities: str
 
-def find_competitors(brand_name: str) -> List[str]:
+class OpportunitiesResponse(BaseModel):
+    brand_name: str
+    detailed_opportunities: str
+
+def get_summary_data(brand_name: str) -> Dict:
     """
-    Use OpenAI to find 5 competitor brands with loyalty programs
+    Get the existing summary data for the brand
     """
-    logger.info(f"Finding competitors for {brand_name}")
-    prompt = f"""Find 5 major competitors of {brand_name} that have loyalty programs. 
-    Return only the brand names separated by commas, nothing else."""
+    response = supabase.table('competitor_summary').select(
+        'competitive_summary, gaps_opportunities'
+    ).eq('brand_name', brand_name).execute()
     
-    response = client.chat.completions.create(
-        model="gpt-4",
+    if not response.data:
+        raise ValueError(f"No summary data found for {brand_name}")
+    
+    return response.data[0]
+
+def analyze_opportunities(brand_name: str, summary_data: Dict) -> DetailedOpportunities:
+    """
+    Create detailed analysis of opportunities
+    """
+    prompt = f"""Based on this competitive analysis for {brand_name}:
+
+    Market Overview: {summary_data.get('competitive_summary', 'N/A')}
+    Initial Opportunities Identified: {summary_data.get('gaps_opportunities', 'N/A')}
+
+    Take the existing opportunities identified, conduct additional research if needed and further reinforce the opportunites or existing gaps in the comeptitive loyalty landscape:
+    1. Common gaps and opportunities
+    2. Gaps and opportunities unique to the brand or industry
+
+    Structure the response in bullet form. Ensure you elaborate on the gaps and opportunities and identify which could provide quick wins and which are longer-term strategic"""
+
+    completion = client.beta.chat.completions.parse(
+        model="gpt-4o-2024-11-20",
         messages=[
-            {"role": "system", "content": "You are a helpful assistant that provides competitor analysis."},
+            {"role": "system", "content": f"You are an analyst helping {brand_name} find opportunities to differentiate it's future loyalty program."},
             {"role": "user", "content": prompt}
-        ]
+        ],
+        response_format=DetailedOpportunities
     )
     
-    competitors = response.choices[0].message.content.strip().split(',')
-    return [comp.strip() for comp in competitors]
+    return completion.choices[0].message.parsed
 
-def insert_competitors(brand_name: str, competitors: List[str]):
+def update_opportunities_analysis(brand_name: str, analysis: DetailedOpportunities):
     """
-    Insert competitors into Supabase table with both brand_name and competitor_name
+    Update the summary table with detailed opportunities
     """
-    logger.info(f"Inserting competitors for {brand_name}: {competitors}")
-    for competitor in competitors:
-        supabase.table('competitors').insert({
-            'brand_name': brand_name,
-            'competitor_name': competitor
-        }).execute()
+    try:
+        response = supabase.table('competitor_summary').update({
+            'detailed_opportunities': analysis.detailed_opportunities
+        }).eq('brand_name', brand_name).execute()
+        
+        logger.info(f"Successfully updated detailed opportunities for {brand_name}")
+        return response.data[0]
+    except Exception as e:
+        logger.error(f"Error updating analysis: {str(e)}")
+        raise
 
+# FastAPI endpoints
 @app.get("/")
 async def root():
     logger.info("Health check endpoint called")
     return {"status": "API is running"}
 
-@app.post("/analyze-competitors")
-async def analyze_competitors(request: BrandRequest):
+@app.post("/opportunities/{brand_name}", response_model=OpportunitiesResponse)
+async def expand_opportunities_analysis(brand_name: str):
+    """
+    Create and save detailed opportunities analysis for a brand
+    """
     try:
-        logger.info(f"Received request to analyze competitors for {request.brand_name}")
-        if not all([os.getenv('OPENAI_API_KEY'), os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_KEY')]):
-            logger.error("Missing environment variables")
-            raise HTTPException(status_code=500, detail="Missing environment variables")
+        logger.info(f"Starting opportunities analysis for brand: {brand_name}")
         
-        competitors = find_competitors(request.brand_name)
-        insert_competitors(request.brand_name, competitors)
+        # Get existing summary data
+        summary_data = get_summary_data(brand_name)
+        logger.info("Retrieved existing summary data")
         
-        logger.info(f"Successfully processed request for {request.brand_name}")
-        return {
-            "brand_name": request.brand_name,
-            "competitors": competitors,
-            "status": "Data successfully stored in Supabase"
-        }
+        # Create detailed analysis
+        detailed_analysis = analyze_opportunities(brand_name, summary_data)
+        logger.info("Created detailed opportunities analysis")
+        
+        # Save the analysis
+        updated_data = update_opportunities_analysis(brand_name, detailed_analysis)
+        
+        return OpportunitiesResponse(
+            brand_name=brand_name,
+            detailed_opportunities=detailed_analysis.detailed_opportunities
+        )
+        
+    except ValueError as e:
+        logger.error(f"Value error: {str(e)}")
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
